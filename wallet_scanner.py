@@ -2,6 +2,7 @@ import os
 import requests
 import random
 import time
+import argparse
 from itertools import permutations, islice
 import math
 import asyncio
@@ -354,8 +355,38 @@ async def get_trx_balance_and_tokens_and_transactions(trx_address):
     return balance_trx_api, token_balances, has_transactions, error_message
 
 # --- 3. Main Logic ---
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Multi-chain wallet permutation/balance scanner. "
+                     "Run several copies in parallel (one per terminal) by giving each "
+                     "a distinct --worker-id so they check disjoint permutation slices."
+    )
+    parser.add_argument(
+        "--worker-id", type=int, default=0,
+        help="0-indexed id of this worker (default: 0).",
+    )
+    parser.add_argument(
+        "--num-workers", type=int, default=1,
+        help="Total number of workers running in parallel across all terminals (default: 1).",
+    )
+    args = parser.parse_args()
+    if not (0 <= args.worker_id < args.num_workers):
+        parser.error(f"--worker-id must be in [0, {args.num_workers}) (got {args.worker_id}).")
+    return args
+
+
 async def main():
+    args = parse_args()
+    worker_id = args.worker_id
+    num_workers = args.num_workers
+    # Each worker gets its own contiguous, non-overlapping slice of the
+    # permutation space so running N of these in parallel actually covers
+    # N times as much ground instead of N processes redoing the same work.
+    slice_start = worker_id * MAX_ATTEMPTS_PER_RUN
+    slice_end = slice_start + MAX_ATTEMPTS_PER_RUN
+
     print(colored("--- Multi-Chain Wallet Balance Scanner (Custom Word Permutations) ---", "cyan"))
+    print(colored(f"[INFO] Worker {worker_id}/{num_workers} — covering permutation indices [{slice_start:,}, {slice_end:,})", "cyan"))
 
     print(colored("!!! Tron (TRX) balances and transactions are verified via the Tronscan API (public endpoint). !!!", "yellow"))
     print(colored("!!! Bitcoin (BTC) balances and transactions are verified via the Blockstream.info API. !!!", "yellow"))
@@ -399,7 +430,7 @@ async def main():
     total_permutations = math.perm(len(WORD_POOL), MNEMONIC_LENGTH)
     print(colored(f"[INFO] Total number of possible combinations ({MNEMONIC_LENGTH} Word from {len(WORD_POOL)}): {total_permutations:,}", "blue"))
 
-    for i, perm_words in enumerate(islice(permutations(WORD_POOL, MNEMONIC_LENGTH), MAX_ATTEMPTS_PER_RUN)):
+    for i, perm_words in enumerate(islice(permutations(WORD_POOL, MNEMONIC_LENGTH), slice_start, slice_end)):
         attempts_made += 1
         current_secret_phrase = " ".join(perm_words)
 
@@ -547,18 +578,22 @@ async def main():
                 status_message += "Transactions"
             print(colored(f"    [+] wallet found {status_message}!", "green"))
 
-            output_path = os.path.join(os.getcwd(), "found_wallets.txt")
+            # Per-worker output file: running several workers in parallel must never
+            # let two processes append to the same file, since each hit is written as
+            # several separate lines and concurrent appends could interleave them.
+            output_path = os.path.join(os.getcwd(), f"found_wallets_worker{worker_id}_pid{os.getpid()}.txt")
+            lines = [f"Mnemonic: {current_secret_phrase}\n"]
+            for chain, addr in derived_addresses.items():
+                # Write only if it's a valid address or explicitly not an error message
+                if "Error" not in str(addr) and "Not installed" not in str(addr):
+                    lines.append(f"{chain} Address: {addr}\n")
+                elif chain == "Bitcoin" and "Not installed" in str(addr):
+                    lines.append(f"{chain} Address: {addr}\n") # Still write the warning to file if it occurs
+            lines.append(f"Estimated Total Value (USD): ${total_sum_usd:.2f}\n")
+            lines.append(f"Transactions Found: {'Yes' if has_any_transactions else 'No'}\n")
+            lines.append("-" * 50 + "\n\n")
             with open(output_path, "a", encoding='utf-8') as f:
-                f.write(f"Mnemonic: {current_secret_phrase}\n")
-                for chain, addr in derived_addresses.items():
-                    # Write only if it's a valid address or explicitly not an error message
-                    if "Error" not in str(addr) and "Not installed" not in str(addr):
-                        f.write(f"{chain} Address: {addr}\n")
-                    elif chain == "Bitcoin" and "Not installed" in str(addr):
-                        f.write(f"{chain} Address: {addr}\n") # Still write the warning to file if it occurs
-                f.write(f"Estimated Total Value (USD): ${total_sum_usd:.2f}\n")
-                f.write(f"Transactions Found: {'Yes' if has_any_transactions else 'No'}\n")
-                f.write("-" * 50 + "\n\n")
+                f.write("".join(lines))
             print(colored(f"    [+] Information is save in {output_path}", "light_yellow"))
         else:
             print(colored("    ❌ Wallet not have balance and transaction not found.", "red"))
