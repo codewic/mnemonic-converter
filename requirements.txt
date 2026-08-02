@@ -1,0 +1,8 @@
+bip_utils
+requests
+termcolor
+eth_account
+mnemonic
+beautifulsoup4
+bitcoinlib
+tronpy
