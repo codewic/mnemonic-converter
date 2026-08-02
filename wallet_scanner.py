@@ -3,6 +3,9 @@ import requests
 import random
 import time
 import argparse
+import json
+import hashlib
+import fcntl
 from itertools import permutations, islice
 import math
 import asyncio
@@ -31,10 +34,14 @@ except ImportError:
 
 # --- 1. Configuration ---
 # !!! ATTENTION !!!
-# This word pool and permutation approach does NOT conform to the BIP-39 mnemonic standard.
-# It is used solely for demonstration purposes and to show how your desired "permutation" logic works.
-# Real BIP-39 uses a fixed 2048-word dictionary and a checksum.
-# Finding a wallet with a balance using this method is practically impossible.
+# WORD_POOL must contain real words from the BIP-39 English wordlist (they are —
+# derive_addresses() validates every permutation with bip_utils' real Bip39SeedGenerator,
+# which enforces the actual BIP-39 checksum). What makes this different from normal
+# wallet recovery is the search space: instead of the full 2048-word dictionary, only
+# permutations of these exact 12 words are tried — meant for the case where you know
+# your words but forgot their order. Only a tiny fraction of orderings will have a
+# valid checksum, and finding a *funded* wallet this way (i.e. guessing someone else's
+# mnemonic) is still practically impossible — this is for recovering your own phrase.
 WORD_POOL = [
 "unable", "belt", "resource", "zoo", "oil", "annual", "height", "adult", "walnut", "junior", "chuckle", "unveil"
 
@@ -52,6 +59,11 @@ COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 
 MAX_ATTEMPTS_PER_RUN = 50000
 MIN_BALANCE_USD_THRESHOLD = 0.0001
+
+# Cross-run, cross-worker progress tracking for the current WORD_POOL. Lets you
+# see how much of the permutation space has been covered so far, and tells you
+# when it's fully exhausted so you know it's time to swap in a new word list.
+STATE_FILE = "state.json"
 
 # Network Configurations - API Keys removed from EVM scanners
 NETWORK_CONFIGS = {
@@ -96,6 +108,58 @@ NETWORK_CONFIGS = {
 }
 
 # --- 2. Helper Functions ---
+
+def _pool_fingerprint() -> str:
+    """Identifies the current WORD_POOL/MNEMONIC_LENGTH/MAX_ATTEMPTS_PER_RUN combo.
+    Changing any of these (e.g. swapping in a new word list) starts fresh tracking
+    in state.json instead of mixing progress from an unrelated combination space."""
+    raw = json.dumps([WORD_POOL, MNEMONIC_LENGTH, MAX_ATTEMPTS_PER_RUN])
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def mark_worker_slice_complete(worker_id: int) -> dict:
+    """
+    Records that `worker_id` finished its slice of the permutation space for the
+    current word pool, then returns the combined progress across every worker
+    that has ever completed a slice for this exact pool (deduplicated, so
+    re-running the same --worker-id twice doesn't double count).
+
+    Uses flock so concurrent terminals updating state.json at the same time
+    don't clobber each other's writes.
+    """
+    state_path = os.path.join(os.getcwd(), STATE_FILE)
+    fingerprint = _pool_fingerprint()
+    total_permutations = math.perm(len(WORD_POOL), MNEMONIC_LENGTH)
+
+    with open(state_path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            state = json.loads(raw) if raw.strip() else {"pools": {}}
+
+            pool_entry = state["pools"].setdefault(fingerprint, {
+                "word_pool": WORD_POOL,
+                "mnemonic_length": MNEMONIC_LENGTH,
+                "max_attempts_per_run": MAX_ATTEMPTS_PER_RUN,
+                "total_permutations": total_permutations,
+                "completed_worker_ids": [],
+            })
+
+            if worker_id not in pool_entry["completed_worker_ids"]:
+                pool_entry["completed_worker_ids"].append(worker_id)
+                pool_entry["completed_worker_ids"].sort()
+
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps(state, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    return pool_entry
+
 
 def derive_addresses(mnemonic_phrase: str, passphrase: str = "") -> dict:
     """
@@ -614,6 +678,36 @@ async def main():
     print(colored(f"Found Valid Mnemonic ( BIP-39 Success): {valid_mnemonics_count}", "green"))
     print(colored(f"Found Wallets With Balance/Transactions: {wallets_with_balance_count}", "green"))
     print(colored(f"Wrong Mnemonic Phrase (BIP-39 Wrong Mnemonic): {invalid_mnemonics_count}", "red"))
+
+    # Only credit this worker-id's slice as done if it actually ran to completion
+    # (not interrupted partway) — a crashed/killed run should just get retried.
+    if attempts_made >= MAX_ATTEMPTS_PER_RUN:
+        pool_entry = mark_worker_slice_complete(worker_id)
+        total_permutations = pool_entry["total_permutations"]
+        completed_slices = len(pool_entry["completed_worker_ids"])
+        checked = min(completed_slices * MAX_ATTEMPTS_PER_RUN, total_permutations)
+        percent = (checked / total_permutations) * 100
+        total_slices_needed = math.ceil(total_permutations / MAX_ATTEMPTS_PER_RUN)
+
+        print(colored(f"\n[STATE] {STATE_FILE} updated — worker-id {worker_id} marked complete for this word pool.", "cyan"))
+        print(colored(
+            f"[STATE] Combined progress for this word pool: {checked:,} / {total_permutations:,} "
+            f"({percent:.6f}%) across {completed_slices:,} / {total_slices_needed:,} worker-id slices.",
+            "cyan",
+        ))
+
+        if checked >= total_permutations:
+            print(colored(
+                "\n[+] Every permutation of the current WORD_POOL has been checked. "
+                "Update WORD_POOL (and clear/rename state.json) to move on to your next word list.",
+                "green",
+            ))
+        else:
+            remaining_slices = total_slices_needed - completed_slices
+            print(colored(
+                f"[STATE] {remaining_slices:,} more worker-id slices needed to fully exhaust this word pool.",
+                "yellow",
+            ))
 
 if __name__ == "__main__":
     asyncio.run(main())
