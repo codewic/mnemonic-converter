@@ -42,6 +42,10 @@ except ImportError:
 # your words but forgot their order. Only a tiny fraction of orderings will have a
 # valid checksum, and finding a *funded* wallet this way (i.e. guessing someone else's
 # mnemonic) is still practically impossible — this is for recovering your own phrase.
+#
+# These two constants are only used to seed WORD_POOLS_FILE the first time it's
+# created. After that, the actual queue of pools to work through lives in that
+# file — see load_word_pools() below — and these constants are no longer read.
 WORD_POOL = [
 "unable", "belt", "resource", "zoo", "oil", "annual", "height", "adult", "walnut", "junior", "chuckle", "unveil"
 
@@ -60,10 +64,19 @@ COINGECKO_API_BASE = "https://api.coingecko.com/api/v3"
 MAX_ATTEMPTS_PER_RUN = 50000
 MIN_BALANCE_USD_THRESHOLD = 0.0001
 
-# Cross-run, cross-worker progress tracking for the current WORD_POOL. Lets you
-# see how much of the permutation space has been covered so far, and tells you
-# when it's fully exhausted so you know it's time to swap in a new word list.
+# Cross-run, cross-worker progress tracking for word pools. Lets you see how much
+# of a pool's permutation space has been covered so far, and (combined with
+# WORD_POOLS_FILE below) lets the scanner auto-advance to the next pool once the
+# current one is fully exhausted.
 STATE_FILE = "state.json"
+
+# Queue of word pools to work through, in order. Auto-created (seeded from
+# WORD_POOL/MNEMONIC_LENGTH above) the first time the scanner runs if it doesn't
+# exist yet. To queue up more pools, add entries shaped like:
+#   {"words": ["word1", "word2", ...], "mnemonic_length": 12}
+# to the JSON list in this file. mnemonic_length must be one of 12/15/18/21/24
+# and "words" must contain at least that many entries.
+WORD_POOLS_FILE = "word_pools.json"
 
 # Network Configurations - API Keys removed from EVM scanners
 NETWORK_CONFIGS = {
@@ -109,18 +122,18 @@ NETWORK_CONFIGS = {
 
 # --- 2. Helper Functions ---
 
-def _pool_fingerprint() -> str:
-    """Identifies the current WORD_POOL/MNEMONIC_LENGTH/MAX_ATTEMPTS_PER_RUN combo.
-    Changing any of these (e.g. swapping in a new word list) starts fresh tracking
-    in state.json instead of mixing progress from an unrelated combination space."""
-    raw = json.dumps([WORD_POOL, MNEMONIC_LENGTH, MAX_ATTEMPTS_PER_RUN])
+def _pool_fingerprint(word_pool: list, mnemonic_length: int, max_attempts_per_run: int) -> str:
+    """Identifies a (word_pool, mnemonic_length, max_attempts_per_run) combo.
+    Two different word pools (or a changed mnemonic length / batch size) always
+    get separate, non-mixing progress entries in state.json."""
+    raw = json.dumps([word_pool, mnemonic_length, max_attempts_per_run])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def mark_worker_slice_complete(worker_id: int) -> dict:
+def mark_worker_slice_complete(worker_id: int, word_pool: list, mnemonic_length: int, max_attempts_per_run: int) -> dict:
     """
     Records that `worker_id` finished its slice of the permutation space for the
-    current word pool, then returns the combined progress across every worker
+    given word pool, then returns the combined progress across every worker
     that has ever completed a slice for this exact pool (deduplicated, so
     re-running the same --worker-id twice doesn't double count).
 
@@ -128,8 +141,8 @@ def mark_worker_slice_complete(worker_id: int) -> dict:
     don't clobber each other's writes.
     """
     state_path = os.path.join(os.getcwd(), STATE_FILE)
-    fingerprint = _pool_fingerprint()
-    total_permutations = math.perm(len(WORD_POOL), MNEMONIC_LENGTH)
+    fingerprint = _pool_fingerprint(word_pool, mnemonic_length, max_attempts_per_run)
+    total_permutations = math.perm(len(word_pool), mnemonic_length)
 
     with open(state_path, "a+", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -139,9 +152,9 @@ def mark_worker_slice_complete(worker_id: int) -> dict:
             state = json.loads(raw) if raw.strip() else {"pools": {}}
 
             pool_entry = state["pools"].setdefault(fingerprint, {
-                "word_pool": WORD_POOL,
-                "mnemonic_length": MNEMONIC_LENGTH,
-                "max_attempts_per_run": MAX_ATTEMPTS_PER_RUN,
+                "word_pool": word_pool,
+                "mnemonic_length": mnemonic_length,
+                "max_attempts_per_run": max_attempts_per_run,
                 "total_permutations": total_permutations,
                 "completed_worker_ids": [],
             })
@@ -159,6 +172,74 @@ def mark_worker_slice_complete(worker_id: int) -> dict:
             fcntl.flock(f, fcntl.LOCK_UN)
 
     return pool_entry
+
+
+def _read_state() -> dict:
+    """Read-only, shared-lock read of state.json (empty skeleton if it doesn't exist yet)."""
+    state_path = os.path.join(os.getcwd(), STATE_FILE)
+    if not os.path.exists(state_path):
+        return {"pools": {}}
+    with open(state_path, "r", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        try:
+            raw = f.read()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return json.loads(raw) if raw.strip() else {"pools": {}}
+
+
+def _is_pool_exhausted(state: dict, word_pool: list, mnemonic_length: int, max_attempts_per_run: int) -> bool:
+    fingerprint = _pool_fingerprint(word_pool, mnemonic_length, max_attempts_per_run)
+    pool_entry = state.get("pools", {}).get(fingerprint)
+    total_permutations = math.perm(len(word_pool), mnemonic_length)
+    total_slices_needed = math.ceil(total_permutations / max_attempts_per_run)
+    completed = len(pool_entry["completed_worker_ids"]) if pool_entry else 0
+    return completed >= total_slices_needed
+
+
+def load_word_pools() -> list:
+    """
+    Loads the queue of word pools to work through, in order, from WORD_POOLS_FILE.
+    Auto-created on first run, seeded from the WORD_POOL/MNEMONIC_LENGTH constants
+    above, so existing setups keep working with zero config changes. Add more
+    {"words": [...], "mnemonic_length": N} entries to the file to queue up
+    further pools — select_active_pool() below picks the first one that isn't
+    fully checked yet.
+    """
+    queue_path = os.path.join(os.getcwd(), WORD_POOLS_FILE)
+
+    if not os.path.exists(queue_path):
+        seed = [{"words": WORD_POOL, "mnemonic_length": MNEMONIC_LENGTH}]
+        with open(queue_path, "w", encoding="utf-8") as f:
+            json.dump(seed, f, indent=2)
+        return seed
+
+    with open(queue_path, "r", encoding="utf-8") as f:
+        raw_pools = json.load(f)
+
+    valid_pools = []
+    for i, entry in enumerate(raw_pools):
+        words = entry.get("words", [])
+        mnemonic_length = entry.get("mnemonic_length", MNEMONIC_LENGTH)
+        if mnemonic_length not in (12, 15, 18, 21, 24):
+            print(colored(f"[!] Skipping {WORD_POOLS_FILE} entry {i}: mnemonic_length must be one of 12/15/18/21/24 (got {mnemonic_length}).", "red"))
+            continue
+        if len(words) < mnemonic_length:
+            print(colored(f"[!] Skipping {WORD_POOLS_FILE} entry {i}: only {len(words)} words, needs at least {mnemonic_length}.", "red"))
+            continue
+        valid_pools.append({"words": words, "mnemonic_length": mnemonic_length})
+
+    return valid_pools
+
+
+def select_active_pool(pools: list):
+    """Returns (index, pool) for the first pool in the queue that isn't fully
+    exhausted yet, or None if every pool in the queue has been completely checked."""
+    state = _read_state()
+    for i, pool in enumerate(pools):
+        if not _is_pool_exhausted(state, pool["words"], pool["mnemonic_length"], MAX_ATTEMPTS_PER_RUN):
+            return i, pool
+    return None
 
 
 def derive_addresses(mnemonic_phrase: str, passphrase: str = "") -> dict:
@@ -443,13 +524,33 @@ async def main():
     args = parse_args()
     worker_id = args.worker_id
     num_workers = args.num_workers
+
+    print(colored("--- Multi-Chain Wallet Balance Scanner (Custom Word Permutations) ---", "cyan"))
+
+    pools = load_word_pools()
+    selection = select_active_pool(pools)
+    if selection is None:
+        print(colored(
+            f"\n[+] Every word pool in {WORD_POOLS_FILE} has been fully checked. "
+            f"Add another {{\"words\": [...], \"mnemonic_length\": N}} entry to that file to keep going.",
+            "green",
+        ))
+        return
+
+    pool_index, active_pool = selection
+    word_pool = active_pool["words"]
+    mnemonic_length = active_pool["mnemonic_length"]
+    print(colored(
+        f"[INFO] Word pool {pool_index + 1}/{len(pools)} from {WORD_POOLS_FILE} is active "
+        f"({len(word_pool)} words, mnemonic length {mnemonic_length}).",
+        "cyan",
+    ))
+
     # Each worker gets its own contiguous, non-overlapping slice of the
     # permutation space so running N of these in parallel actually covers
     # N times as much ground instead of N processes redoing the same work.
     slice_start = worker_id * MAX_ATTEMPTS_PER_RUN
     slice_end = slice_start + MAX_ATTEMPTS_PER_RUN
-
-    print(colored("--- Multi-Chain Wallet Balance Scanner (Custom Word Permutations) ---", "cyan"))
     print(colored(f"[INFO] Worker {worker_id}/{num_workers} — covering permutation indices [{slice_start:,}, {slice_end:,})", "cyan"))
 
     print(colored("!!! Tron (TRX) balances and transactions are verified via the Tronscan API (public endpoint). !!!", "yellow"))
@@ -457,10 +558,6 @@ async def main():
 
 
     print(colored("-" * 60, "white"))
-
-    if len(WORD_POOL) < MNEMONIC_LENGTH:
-        print(colored(f"[-] Error: WORD_POOL must contain at least{MNEMONIC_LENGTH} A unique word {MNEMONIC_LENGTH}-To generate a verbal mnemonic.", "red"))
-        return
 
     coin_ids_for_prices = set()
     for net_config in NETWORK_CONFIGS.values():
@@ -491,10 +588,10 @@ async def main():
     print(colored(f"\n[+] Start generating permutations and checking your words ({MAX_ATTEMPTS_PER_RUN} With a limit of attempts)...", "cyan"))
     print(colored("-" * 60, "white"))
 
-    total_permutations = math.perm(len(WORD_POOL), MNEMONIC_LENGTH)
-    print(colored(f"[INFO] Total number of possible combinations ({MNEMONIC_LENGTH} Word from {len(WORD_POOL)}): {total_permutations:,}", "blue"))
+    total_permutations = math.perm(len(word_pool), mnemonic_length)
+    print(colored(f"[INFO] Total number of possible combinations ({mnemonic_length} Word from {len(word_pool)}): {total_permutations:,}", "blue"))
 
-    for i, perm_words in enumerate(islice(permutations(WORD_POOL, MNEMONIC_LENGTH), slice_start, slice_end)):
+    for i, perm_words in enumerate(islice(permutations(word_pool, mnemonic_length), slice_start, slice_end)):
         attempts_made += 1
         current_secret_phrase = " ".join(perm_words)
 
@@ -682,30 +779,30 @@ async def main():
     # Only credit this worker-id's slice as done if it actually ran to completion
     # (not interrupted partway) — a crashed/killed run should just get retried.
     if attempts_made >= MAX_ATTEMPTS_PER_RUN:
-        pool_entry = mark_worker_slice_complete(worker_id)
+        pool_entry = mark_worker_slice_complete(worker_id, word_pool, mnemonic_length, MAX_ATTEMPTS_PER_RUN)
         total_permutations = pool_entry["total_permutations"]
         completed_slices = len(pool_entry["completed_worker_ids"])
         checked = min(completed_slices * MAX_ATTEMPTS_PER_RUN, total_permutations)
         percent = (checked / total_permutations) * 100
         total_slices_needed = math.ceil(total_permutations / MAX_ATTEMPTS_PER_RUN)
 
-        print(colored(f"\n[STATE] {STATE_FILE} updated — worker-id {worker_id} marked complete for this word pool.", "cyan"))
+        print(colored(f"\n[STATE] {STATE_FILE} updated — worker-id {worker_id} marked complete for word pool {pool_index + 1}/{len(pools)}.", "cyan"))
         print(colored(
-            f"[STATE] Combined progress for this word pool: {checked:,} / {total_permutations:,} "
+            f"[STATE] Combined progress for this pool: {checked:,} / {total_permutations:,} "
             f"({percent:.6f}%) across {completed_slices:,} / {total_slices_needed:,} worker-id slices.",
             "cyan",
         ))
 
         if checked >= total_permutations:
             print(colored(
-                "\n[+] Every permutation of the current WORD_POOL has been checked. "
-                "Update WORD_POOL (and clear/rename state.json) to move on to your next word list.",
+                f"\n[+] Every permutation of word pool {pool_index + 1}/{len(pools)} has been checked. "
+                f"The next run will auto-advance to the next unexhausted pool in {WORD_POOLS_FILE} (if any remain).",
                 "green",
             ))
         else:
             remaining_slices = total_slices_needed - completed_slices
             print(colored(
-                f"[STATE] {remaining_slices:,} more worker-id slices needed to fully exhaust this word pool.",
+                f"[STATE] {remaining_slices:,} more worker-id slices needed to fully exhaust this pool.",
                 "yellow",
             ))
 
