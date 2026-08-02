@@ -6,6 +6,7 @@ import argparse
 import json
 import hashlib
 import fcntl
+from datetime import datetime, timezone
 from itertools import permutations, islice
 import math
 import asyncio
@@ -69,6 +70,11 @@ MIN_BALANCE_USD_THRESHOLD = 0.0001
 # WORD_POOLS_FILE below) lets the scanner auto-advance to the next pool once the
 # current one is fully exhausted.
 STATE_FILE = "state.json"
+
+# How often (in attempts) a running worker writes its in-progress attempt count
+# to state.json, so you can see live progress mid-slice instead of only once the
+# whole MAX_ATTEMPTS_PER_RUN-sized slice finishes.
+CHECKPOINT_INTERVAL_ATTEMPTS = 200
 
 # Queue of word pools to work through, in order. Auto-created (seeded from
 # WORD_POOL/MNEMONIC_LENGTH above) the first time the scanner runs if it doesn't
@@ -157,11 +163,15 @@ def mark_worker_slice_complete(worker_id: int, word_pool: list, mnemonic_length:
                 "max_attempts_per_run": max_attempts_per_run,
                 "total_permutations": total_permutations,
                 "completed_worker_ids": [],
+                "in_progress": {},
             })
 
             if worker_id not in pool_entry["completed_worker_ids"]:
                 pool_entry["completed_worker_ids"].append(worker_id)
                 pool_entry["completed_worker_ids"].sort()
+
+            # This worker-id is done, so it's no longer "in progress".
+            pool_entry.setdefault("in_progress", {}).pop(str(worker_id), None)
 
             f.seek(0)
             f.truncate()
@@ -172,6 +182,50 @@ def mark_worker_slice_complete(worker_id: int, word_pool: list, mnemonic_length:
             fcntl.flock(f, fcntl.LOCK_UN)
 
     return pool_entry
+
+
+def checkpoint_worker_progress(worker_id: int, word_pool: list, mnemonic_length: int,
+                                max_attempts_per_run: int, attempts_made: int) -> None:
+    """
+    Records how far `worker_id` has gotten through its current slice, without
+    marking the slice as complete. Called periodically (every
+    CHECKPOINT_INTERVAL_ATTEMPTS attempts) during the run so state.json reflects
+    live progress instead of only updating once the whole slice finishes.
+    """
+    state_path = os.path.join(os.getcwd(), STATE_FILE)
+    fingerprint = _pool_fingerprint(word_pool, mnemonic_length, max_attempts_per_run)
+    total_permutations = math.perm(len(word_pool), mnemonic_length)
+
+    with open(state_path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            raw = f.read()
+            state = json.loads(raw) if raw.strip() else {"pools": {}}
+
+            pool_entry = state["pools"].setdefault(fingerprint, {
+                "word_pool": word_pool,
+                "mnemonic_length": mnemonic_length,
+                "max_attempts_per_run": max_attempts_per_run,
+                "total_permutations": total_permutations,
+                "completed_worker_ids": [],
+                "in_progress": {},
+            })
+
+            pool_entry.setdefault("in_progress", {})[str(worker_id)] = {
+                "attempts_made": attempts_made,
+                "max_attempts_per_run": max_attempts_per_run,
+                "pid": os.getpid(),
+                "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+
+            f.seek(0)
+            f.truncate()
+            f.write(json.dumps(state, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def _read_state() -> dict:
@@ -762,6 +816,11 @@ async def main():
         # Displaying progress
         if attempts_made % 10 == 0 or attempts_made == MAX_ATTEMPTS_PER_RUN:
             print(colored(f"\n[INFO] checking {attempts_made:,} Mnemonic. Valid: {valid_mnemonics_count}, Wallets With balance/Transactions: {wallets_with_balance_count}, wrong (BIP-39 checking is not success): {invalid_mnemonics_count}", "cyan"))
+
+        # Mid-slice checkpoint: lets `state.json` show live progress instead of
+        # only updating once the entire MAX_ATTEMPTS_PER_RUN-sized slice finishes.
+        if attempts_made % CHECKPOINT_INTERVAL_ATTEMPTS == 0:
+            checkpoint_worker_progress(worker_id, word_pool, mnemonic_length, MAX_ATTEMPTS_PER_RUN, attempts_made)
 
         if attempts_made >= MAX_ATTEMPTS_PER_RUN:
             print(colored(f"\n[INFO] Max Limited success ({MAX_ATTEMPTS_PER_RUN}). Program Stoped.", "yellow"))

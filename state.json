@@ -1,0 +1,32 @@
+{
+  "pools": {
+    "60ec53541b6d6b86": {
+      "word_pool": [
+        "unable",
+        "belt",
+        "resource",
+        "zoo",
+        "oil",
+        "annual",
+        "height",
+        "adult",
+        "walnut",
+        "junior",
+        "chuckle",
+        "unveil"
+      ],
+      "mnemonic_length": 12,
+      "max_attempts_per_run": 50000,
+      "total_permutations": 479001600,
+      "completed_worker_ids": [],
+      "in_progress": {
+        "3": {
+          "attempts_made": 1234,
+          "max_attempts_per_run": 50000,
+          "pid": 1403726,
+          "updated_at": "2026-08-02T20:09:39+00:00"
+        }
+      }
+    }
+  }
+}
